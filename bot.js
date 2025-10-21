@@ -35,7 +35,88 @@ const bot = new Bot(process.env.BOT_TOKEN);
 bot.api.config.use(autoRetry());
 
 // 限制并发翻译请求
-const limit = pLimit(3);
+const limit = pLimit(1); // 减少并发数
+
+// 翻译请求缓存
+const translationCache = new Map();
+const CACHE_DURATION = 5 * 60 * 1000; // 5分钟缓存
+
+// 备用翻译服务
+async function fallbackTranslate(text, targetLang) {
+  try {
+    // 使用 LibreTranslate 作为备用
+    const response = await fetch('https://libretranslate.de/translate', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        q: text,
+        source: 'auto',
+        target: targetLang === 'ru' ? 'ru' : 'zh',
+        format: 'text'
+      })
+    });
+    
+    const data = await response.json();
+    return {
+      text: data.translatedText,
+      raw: { src: 'auto' }
+    };
+  } catch (error) {
+    console.error('Fallback translation failed:', error);
+    throw error;
+  }
+}
+
+// 重试函数
+async function retryTranslate(text, options, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      // 检查缓存
+      const cacheKey = `${text}_${options.to}`;
+      const cached = translationCache.get(cacheKey);
+      if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+        return cached.result;
+      }
+
+      // 添加延迟避免频率限制
+      if (i > 0) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * i));
+      }
+
+      const result = await translate(text, options);
+      
+      // 缓存结果
+      translationCache.set(cacheKey, {
+        result,
+        timestamp: Date.now()
+      });
+      
+      return result;
+    } catch (error) {
+      console.error(`Translation attempt ${i + 1} failed:`, error.message);
+      
+      if (error.message.includes('Too Many Requests') && i < maxRetries - 1) {
+        // 等待更长时间再重试
+        await new Promise(resolve => setTimeout(resolve, 5000 * (i + 1)));
+        continue;
+      }
+      
+      // 如果 Google Translate 失败，尝试备用服务
+      if (i === maxRetries - 1) {
+        console.log('Trying fallback translation service...');
+        try {
+          return await fallbackTranslate(text, options.to);
+        } catch (fallbackError) {
+          console.error('Fallback translation also failed:', fallbackError);
+        }
+      }
+      
+      throw error;
+    }
+  }
+}
 
 // 允许私聊和群组消息（便于测试）
 bot.use((ctx, next) => {
@@ -56,7 +137,7 @@ bot.on("message:text", async (ctx) => {
     // 使用限制器避免过多并发请求
     await limit(async () => {
       // 检测语言并翻译
-      const result = await translate(text, { 
+      const result = await retryTranslate(text, { 
         to: 'zh'
       });
 
@@ -66,7 +147,7 @@ bot.on("message:text", async (ctx) => {
       } 
       // 如果检测到的语言是中文，翻译成俄语
       else if (result.raw.src === 'zh' || result.raw.src === 'zh-CN') {
-        const ruResult = await translate(text, { 
+        const ruResult = await retryTranslate(text, { 
           to: 'ru'
         });
         await ctx.reply(`🇨🇳→🇷🇺 ${ruResult.text}`);
@@ -75,7 +156,13 @@ bot.on("message:text", async (ctx) => {
     });
   } catch (error) {
     console.error('Translation error:', error);
-    // 静默处理错误，避免spam
+    
+    // 如果是频率限制错误，发送友好提示
+    if (error.message.includes('Too Many Requests')) {
+      await ctx.reply('⏳ 翻译服务暂时繁忙，请稍后再试。');
+    } else {
+      // 其他错误静默处理
+    }
   }
 });
 
