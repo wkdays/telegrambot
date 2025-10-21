@@ -1,9 +1,32 @@
-
 require('dotenv').config();
+const express = require('express');
 const { Bot } = require("grammy");
 const { autoRetry } = require("@grammyjs/auto-retry");
 const { translate } = require("@vitalets/google-translate-api");
 const pLimit = require('p-limit').default;
+
+// Express 应用设置
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// 健康检查端点
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'ok', 
+    service: 'telegram-ru-zh-bot',
+    timestamp: new Date().toISOString(),
+    bot: 'running'
+  });
+});
+
+// 根路径
+app.get('/', (req, res) => {
+  res.status(200).json({ 
+    message: 'Telegram RU↔ZH Translate Bot is running',
+    status: 'active',
+    features: ['russian-chinese-translation', 'voice-support-planned']
+  });
+});
 
 // 创建一个Bot类的实例，并将之前创建好的 bot token传给它
 const bot = new Bot(process.env.BOT_TOKEN);
@@ -77,6 +100,11 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
 // 错误处理
 bot.catch((err) => {
   console.error('Bot error:', err);
+});
+
+// 启动 HTTP 服务器
+app.listen(PORT, () => {
+  console.log(`🌐 HTTP server listening on port ${PORT}`);
 });
 
 // 启动 bot
