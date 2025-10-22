@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const { Bot } = require("grammy");
 const { autoRetry } = require("@grammyjs/auto-retry");
-const { translate } = require("@vitalets/google-translate-api");
+const deepl = require('deepl-node');
 const pLimit = require('p-limit').default;
 
 // Express 应用设置
@@ -34,6 +34,9 @@ const bot = new Bot(process.env.BOT_TOKEN);
 // 设置自动重试
 bot.api.config.use(autoRetry());
 
+// 初始化 DeepL 翻译器
+const translator = new deepl.Translator(process.env.DEEPL_API_KEY);
+
 // 限制并发翻译请求
 const limit = pLimit(1); // 减少并发数
 
@@ -41,10 +44,27 @@ const limit = pLimit(1); // 减少并发数
 const translationCache = new Map();
 const CACHE_DURATION = 5 * 60 * 1000; // 5分钟缓存
 
-// 备用翻译服务
+// 语言检测函数
+async function detectLanguage(text) {
+  try {
+    // 使用 DeepL 检测语言
+    const result = await translator.translateText(text, null, 'en-US');
+    return result.detectedSourceLang;
+  } catch (error) {
+    console.error('Language detection failed:', error);
+    // 简单的启发式检测
+    if (/[\u4e00-\u9fff]/.test(text)) {
+      return 'zh';
+    } else if (/[а-яё]/i.test(text)) {
+      return 'ru';
+    }
+    return 'auto';
+  }
+}
+
+// 备用翻译服务（LibreTranslate）
 async function fallbackTranslate(text, targetLang) {
   try {
-    // 使用 LibreTranslate 作为备用
     const response = await fetch('https://libretranslate.de/translate', {
       method: 'POST',
       headers: {
@@ -61,7 +81,7 @@ async function fallbackTranslate(text, targetLang) {
     const data = await response.json();
     return {
       text: data.translatedText,
-      raw: { src: 'auto' }
+      detectedSourceLang: 'auto'
     };
   } catch (error) {
     console.error('Fallback translation failed:', error);
@@ -69,12 +89,12 @@ async function fallbackTranslate(text, targetLang) {
   }
 }
 
-// 重试函数
-async function retryTranslate(text, options, maxRetries = 3) {
+// DeepL 翻译函数
+async function translateWithDeepL(text, targetLang, maxRetries = 3) {
   for (let i = 0; i < maxRetries; i++) {
     try {
       // 检查缓存
-      const cacheKey = `${text}_${options.to}`;
+      const cacheKey = `${text}_${targetLang}`;
       const cached = translationCache.get(cacheKey);
       if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
         return cached.result;
@@ -85,29 +105,35 @@ async function retryTranslate(text, options, maxRetries = 3) {
         await new Promise(resolve => setTimeout(resolve, 1000 * i));
       }
 
-      const result = await translate(text, options);
+      // 使用 DeepL 翻译
+      const result = await translator.translateText(text, null, targetLang);
+      
+      const translationResult = {
+        text: result.text,
+        detectedSourceLang: result.detectedSourceLang
+      };
       
       // 缓存结果
       translationCache.set(cacheKey, {
-        result,
+        result: translationResult,
         timestamp: Date.now()
       });
       
-      return result;
+      return translationResult;
     } catch (error) {
-      console.error(`Translation attempt ${i + 1} failed:`, error.message);
+      console.error(`DeepL translation attempt ${i + 1} failed:`, error.message);
       
-      if (error.message.includes('Too Many Requests') && i < maxRetries - 1) {
-        // 等待更长时间再重试
-        await new Promise(resolve => setTimeout(resolve, 5000 * (i + 1)));
+      // 如果是配额限制，等待更长时间
+      if (error.message.includes('quota') && i < maxRetries - 1) {
+        await new Promise(resolve => setTimeout(resolve, 10000 * (i + 1)));
         continue;
       }
       
-      // 如果 Google Translate 失败，尝试备用服务
+      // 如果是其他错误，尝试备用服务
       if (i === maxRetries - 1) {
         console.log('Trying fallback translation service...');
         try {
-          return await fallbackTranslate(text, options.to);
+          return await fallbackTranslate(text, targetLang);
         } catch (fallbackError) {
           console.error('Fallback translation also failed:', fallbackError);
         }
@@ -136,32 +162,30 @@ bot.on("message:text", async (ctx) => {
   try {
     // 使用限制器避免过多并发请求
     await limit(async () => {
-      // 检测语言并翻译
-      const result = await retryTranslate(text, { 
-        to: 'zh'
-      });
-
+      // 检测语言
+      const detectedLang = await detectLanguage(text);
+      
       // 如果检测到的语言是俄语，翻译成中文
-      if (result.raw.src === 'ru') {
+      if (detectedLang === 'ru') {
+        const result = await translateWithDeepL(text, 'zh');
         await ctx.reply(`🇷🇺→🇨🇳 ${result.text}`);
       } 
       // 如果检测到的语言是中文，翻译成俄语
-      else if (result.raw.src === 'zh' || result.raw.src === 'zh-CN') {
-        const ruResult = await retryTranslate(text, { 
-          to: 'ru'
-        });
-        await ctx.reply(`🇨🇳→🇷🇺 ${ruResult.text}`);
+      else if (detectedLang === 'zh') {
+        const result = await translateWithDeepL(text, 'ru');
+        await ctx.reply(`🇨🇳→🇷🇺 ${result.text}`);
       }
       // 其他语言不处理
     });
   } catch (error) {
     console.error('Translation error:', error);
     
-    // 如果是频率限制错误，发送友好提示
-    if (error.message.includes('Too Many Requests')) {
-      await ctx.reply('⏳ 翻译服务暂时繁忙，请稍后再试。');
+    // 如果是配额限制错误，发送友好提示
+    if (error.message.includes('quota') || error.message.includes('Too Many Requests')) {
+      await ctx.reply('⏳ sever is busy ,try again later!');
     } else {
       // 其他错误静默处理
+      console.error('Translation failed:', error.message);
     }
   }
 });

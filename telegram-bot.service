@@ -1,0 +1,27 @@
+[Unit]
+Description=Telegram RU-ZH Translate Bot
+After=network.target
+
+[Service]
+Type=simple
+User=nodejs
+WorkingDirectory=/opt/telegram-bot
+ExecStart=/usr/bin/node bot.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/telegram-bot/.env
+
+# 安全设置
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/telegram-bot/logs
+
+# 资源限制
+LimitNOFILE=65536
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
